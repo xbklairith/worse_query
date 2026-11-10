@@ -29,5 +29,6 @@
 #import <Foundation/Foundation.h>
 
 NSArray<NSString *> *pathleak(NSString *filter, uint64_t max_inode);
+NSArray<NSString *> *pathleak_range(NSString *filter, uint64_t min_inode, uint64_t max_inode);
 
 #endif /* pathleak_h */

