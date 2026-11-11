@@ -11,6 +11,9 @@ struct ContentView: View {
     @StateObject private var console = Console()
     @State private var sandboxHandle: Int64?
     @State private var path = "/private/var/mobile/Containers/Data/Application/"
+    @State private var findings: [Finding] = []
+    @State private var reportURL: URL?
+    @State private var showShareSheet = false
     
     var body: some View {
         NavigationStack {
@@ -52,8 +55,37 @@ struct ContentView: View {
                     Button("Get Paths (parentdir)") {
                         listPaths(path)
                     }
+                    Button("Auto Scan All Apps") {
+                        findings = []
+                        autoScan()
+                    }
                  }
                 .disabled(path.isEmpty)
+
+                if !findings.isEmpty {
+                    Section("Findings (\(findings.count))") {
+                        let sorted = findings.sorted { $0.severity > $1.severity }
+                        ForEach(sorted) { f in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text("[\(f.severity.rawValue)] \(f.bundleId)")
+                                    .font(.system(.caption, design: .monospaced))
+                                    .bold()
+                                Text("\(f.type.rawValue): \(f.key)")
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        Button("Export JSON") {
+                            reportURL = exportFindings(findings)
+                            showShareSheet = reportURL != nil
+                        }
+                    }
+                    .sheet(isPresented: $showShareSheet) {
+                        if let url = reportURL {
+                            ShareSheet(url: url)
+                        }
+                    }
+                }
                 
                 Section("Log") {
                     ScrollViewReader { proxy in
@@ -228,6 +260,79 @@ struct ContentView: View {
         return handle
     }
 
+    func autoScan() {
+        let scanRoot = "/private/var/mobile/Containers/Data/Application/"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let files = FileManager.default
+            let groupRoot = files.containerURL(forSecurityApplicationGroupIdentifier: "group.com.xb.wqtest")
+            let baseDir = groupRoot ?? files.temporaryDirectory
+            let baselineURL = baseDir.appendingPathComponent(".bl_\(UUID().uuidString)")
+            var baselineInode: UInt64 = 0
+            do {
+                try "x".write(to: baselineURL, atomically: true, encoding: .utf8)
+                var info = stat()
+                if stat(baselineURL.path, &info) == 0 { baselineInode = info.st_ino }
+                try files.removeItem(at: baselineURL)
+            } catch { return }
+
+            DispatchQueue.main.async { print("auto scan baseline: \(baselineInode)") }
+
+            func scanRange(_ lo: UInt64, _ hi: UInt64) {
+                let paths = pathleak_range(scanRoot, lo, hi) ?? []
+                for containerPath in paths {
+                    let isAppGroup = containerPath.contains("/Shared/AppGroup")
+                    let needsWorkaround = isAppGroup && ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+                    let handle = worse_query(containerPath, "group.com.xb.wqtest", needsWorkaround, false)
+                    guard handle > 0 else { continue }
+
+                    var buf = [CChar](repeating: 0, count: 512)
+                    let len = getxattr(containerPath, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
+                    let bundleId = len > 0 ? String(cString: buf) : "unknown"
+
+                    let newFindings = ContainerScanner.scan(containerPath: containerPath, bundleId: bundleId)
+
+                    worse_query_release(handle)
+
+                    if !newFindings.isEmpty {
+                        DispatchQueue.main.async {
+                            print("\(bundleId): \(newFindings.count) finding(s)")
+                            self.findings.append(contentsOf: newFindings)
+                        }
+                    }
+                }
+            }
+
+            let window: UInt64 = 2_000_000
+            let minRecent = baselineInode > window ? baselineInode - window : 1
+            scanRange(minRecent, baselineInode)
+
+            if minRecent > 1 {
+                var hi = minRecent - 1
+                let chunk: UInt64 = 5_000_000
+                while hi > 0 {
+                    let lo = hi > chunk ? hi - chunk + 1 : 1
+                    scanRange(lo, hi)
+                    if lo == 1 { break }
+                    hi = lo - 1
+                }
+            }
+            DispatchQueue.main.async { print("--- auto scan done: \(self.findings.count) total findings ---") }
+        }
+    }
+
+    func exportFindings(_ findings: [Finding]) -> URL? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(findings) else { return nil }
+        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let name = "scan-\(formatter.string(from: Date())).json"
+        let url = docs.appendingPathComponent(name)
+        try? data.write(to: url)
+        return url
+    }
+
     func releaseExtension(_ handle: Int64) {
         if handle < 0 {
             print("sandbox extension hasn't been consumed!")
@@ -236,4 +341,14 @@ struct ContentView: View {
         worse_query_release(handle)
         print("released sandbox extension!")
     }
+}
+
+import UIKit
+
+struct ShareSheet: UIViewControllerRepresentable {
+    let url: URL
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: [url], applicationActivities: nil)
+    }
+    func updateUIViewController(_ vc: UIActivityViewController, context: Context) {}
 }
