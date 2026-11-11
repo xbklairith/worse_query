@@ -14,7 +14,7 @@ struct AppBrowserView: View {
         NavigationStack {
             List {
                 ForEach($containers) { $app in
-                    Section(header: Text(app.bundleId).font(.system(.caption, design: .monospaced))) {
+                    Section {
                         ForEach($app.files) { $file in
                             HStack {
                                 Image(systemName: file.selected ? "checkmark.square.fill" : "square")
@@ -29,6 +29,23 @@ struct AppBrowserView: View {
                                         .foregroundColor(.secondary)
                                 }
                             }
+                        }
+                    } header: {
+                        HStack {
+                            Text(app.bundleId)
+                                .font(.system(.caption, design: .monospaced))
+                            Spacer()
+                            let allSelected = app.files.allSatisfy { $0.selected }
+                            Button(allSelected ? "Deselect All" : "Dump All") {
+                                let idx = containers.firstIndex(where: { $0.id == app.id })!
+                                let newVal = !allSelected
+                                for j in containers[idx].files.indices {
+                                    containers[idx].files[j].selected = newVal
+                                }
+                            }
+                            .font(.caption2)
+                            .buttonStyle(.bordered)
+                            .tint(allSelected ? .red : .green)
                         }
                     }
                 }
