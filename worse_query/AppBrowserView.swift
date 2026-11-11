@@ -8,6 +8,8 @@ struct AppBrowserView: View {
     @State private var dumping = false
     @State private var zipping = false
     @State private var zippingBundleId: String?
+    @State private var exportURL: URL?
+    @State private var showExporter = false
 
     var selectedCount: Int {
         containers.flatMap { $0.files }.filter { $0.selected }.count
@@ -89,6 +91,9 @@ struct AppBrowserView: View {
             .sheet(isPresented: $showShare) {
                 if let url = shareURL { ShareSheet(url: url) }
             }
+            .sheet(isPresented: $showExporter) {
+                if let url = exportURL { DocumentExporter(url: url, isPresented: $showExporter) }
+            }
         }
     }
 
@@ -156,7 +161,8 @@ struct AppBrowserView: View {
             let formatter = DateFormatter()
             formatter.dateFormat = "yyyyMMdd-HHmmss"
             let name = "\(app.bundleId)-\(formatter.string(from: Date())).zip"
-            let zipURL = fm.temporaryDirectory.appendingPathComponent(name)
+            let docs = fm.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            let zipURL = docs.appendingPathComponent(name)
             try? fm.removeItem(at: zipURL)
 
             let sourceURL = URL(fileURLWithPath: app.containerPath)
@@ -172,8 +178,8 @@ struct AppBrowserView: View {
             DispatchQueue.main.async {
                 zipping = false
                 zippingBundleId = nil
-                shareURL = zipURL
-                showShare = true
+                exportURL = zipURL
+                showExporter = true
             }
         }
     }
@@ -182,5 +188,36 @@ struct AppBrowserView: View {
         if bytes < 1024 { return "\(bytes) B" }
         if bytes < 1024 * 1024 { return String(format: "%.1f KB", Double(bytes) / 1024) }
         return String(format: "%.1f MB", Double(bytes) / 1024 / 1024)
+    }
+}
+
+import UIKit
+
+// Uses UIDocumentPickerViewController (export mode) instead of UIActivityViewController.
+// This lets the user pick "On My iPhone" or any local Files location, bypassing iCloud
+// rate limits that cause "operation not permitted" after a few saves.
+struct DocumentExporter: UIViewControllerRepresentable {
+    let url: URL
+    @Binding var isPresented: Bool
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        let picker = UIDocumentPickerViewController(forExporting: [url], asCopy: true)
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ vc: UIDocumentPickerViewController, context: Context) {}
+
+    class Coordinator: NSObject, UIDocumentPickerDelegate {
+        let parent: DocumentExporter
+        init(_ parent: DocumentExporter) { self.parent = parent }
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            parent.isPresented = false
+        }
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            parent.isPresented = false
+        }
     }
 }
