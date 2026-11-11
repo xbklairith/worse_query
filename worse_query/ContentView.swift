@@ -14,6 +14,9 @@ struct ContentView: View {
     @State private var findings: [Finding] = []
     @State private var reportURL: URL?
     @State private var showShareSheet = false
+    @State private var containers: [AppContainer] = []
+    @State private var showBrowser = false
+    @State private var scanning = false
     
     var body: some View {
         NavigationStack {
@@ -58,6 +61,16 @@ struct ContentView: View {
                     Button("Auto Scan All Apps") {
                         findings = []
                         autoScan()
+                    }
+                    Button(scanning ? "Scanning…" : "Browse Files") {
+                        containers = []
+                        scanForBrowser()
+                    }
+                    .disabled(scanning)
+                    if !containers.isEmpty {
+                        NavigationLink("Open Browser (\(containers.count) apps)") {
+                            AppBrowserView(containers: $containers)
+                        }
                     }
                  }
                 .disabled(path.isEmpty)
@@ -258,6 +271,91 @@ struct ContentView: View {
             print("handle: \(handle)")
         }
         return handle
+    }
+
+    func scanForBrowser() {
+        scanning = true
+        let scanRoot = "/private/var/mobile/Containers/Data/Application/"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let fm = FileManager.default
+            let groupRoot = fm.containerURL(forSecurityApplicationGroupIdentifier: "group.com.xb.wqtest")
+            let baseDir = groupRoot ?? fm.temporaryDirectory
+            let baselineURL = baseDir.appendingPathComponent(".bl2_\(UUID().uuidString)")
+            var baselineInode: UInt64 = 0
+            do {
+                try "x".write(to: baselineURL, atomically: true, encoding: .utf8)
+                var info = stat()
+                if stat(baselineURL.path, &info) == 0 { baselineInode = info.st_ino }
+                try fm.removeItem(at: baselineURL)
+            } catch {
+                DispatchQueue.main.async { scanning = false }
+                return
+            }
+
+            func processRange(_ lo: UInt64, _ hi: UInt64) {
+                let paths = pathleak_range(scanRoot, lo, hi) ?? []
+                for containerPath in paths {
+                    let isAppGroup = containerPath.contains("/Shared/AppGroup")
+                    let needsWorkaround = isAppGroup && ProcessInfo.processInfo.operatingSystemVersion.majorVersion == 26
+                    let handle = worse_query(containerPath, "group.com.xb.wqtest", needsWorkaround, false)
+                    guard handle > 0 else { continue }
+
+                    var buf = [CChar](repeating: 0, count: 512)
+                    let len = getxattr(containerPath, "com.apple.containermanager.identifier", &buf, 511, 0, 0)
+                    let bundleId = len > 0 ? String(cString: buf) : "unknown.\(containerPath.suffix(8))"
+
+                    var entries: [FileEntry] = []
+                    listFiles(root: containerPath, current: containerPath, entries: &entries, depth: 8)
+
+                    worse_query_release(handle)
+
+                    if !entries.isEmpty {
+                        let app = AppContainer(bundleId: bundleId, containerPath: containerPath, files: entries)
+                        DispatchQueue.main.async {
+                            self.containers.append(app)
+                            print("\(bundleId): \(entries.count) files")
+                        }
+                    }
+                }
+            }
+
+            let window: UInt64 = 2_000_000
+            let minRecent = baselineInode > window ? baselineInode - window : 1
+            processRange(minRecent, baselineInode)
+            if minRecent > 1 {
+                var hi = minRecent - 1
+                let chunk: UInt64 = 5_000_000
+                while hi > 0 {
+                    let lo = hi > chunk ? hi - chunk + 1 : 1
+                    processRange(lo, hi)
+                    if lo == 1 { break }
+                    hi = lo - 1
+                }
+            }
+            DispatchQueue.main.async {
+                self.scanning = false
+                self.showBrowser = true
+                print("--- browse scan done: \(self.containers.count) apps ---")
+            }
+        }
+    }
+
+    func listFiles(root: String, current: String, entries: inout [FileEntry], depth: Int) {
+        guard depth > 0 else { return }
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(atPath: current) else { return }
+        for item in items {
+            let full = current + "/" + item
+            let rel  = String(full.dropFirst(root.count + 1))
+            var isDir: ObjCBool = false
+            fm.fileExists(atPath: full, isDirectory: &isDir)
+            if isDir.boolValue {
+                listFiles(root: root, current: full, entries: &entries, depth: depth - 1)
+            } else {
+                let size = (try? fm.attributesOfItem(atPath: full)[.size] as? Int64) ?? 0
+                entries.append(FileEntry(relativePath: rel, absolutePath: full, size: size))
+            }
+        }
     }
 
     func autoScan() {
